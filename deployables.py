@@ -82,7 +82,7 @@ def pack_around_ligand(
 
 
 @requires_init
-def mpnn_binder(
+def mpnn_around_ligand(
     packed_pose_in: Optional[PackedPose] = None, **kwargs
 ) -> Iterator[PackedPose]:
     """
@@ -100,15 +100,15 @@ def mpnn_binder(
     from pyrosetta.rosetta.core.select.residue_selector import (
         AndResidueSelector,
         ChainSelector,
-        NeighborhoodResidueSelector,
-        TrueResidueSelector,
+        NotResidueSelector,
+        ResidueIndexSelector,
     )
 
     # insert the root of the repo into the sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from crispy_shifty.protocols.cleaning import path_to_pose_or_ppose
     from crispy_shifty.protocols.design import interface_between_selectors
-    from crispy_shifty.protocols.mpnn import MPNNDesign
+    from crispy_shifty.protocols.mpnn import MPNNLigandDesign, MPNNDesign
     from crispy_shifty.utils.io import print_timestamp
 
     start_time = time()
@@ -122,91 +122,68 @@ def mpnn_binder(
         poses = path_to_pose_or_ppose(
             path=pdb_path, cluster_scores=True, pack_result=False
         )
+    # try to get ligand_params from kwargs
+    try:
+        params_path = kwargs["ligand_params"]
+    except KeyError:
+        raise KeyError("No ligand_params provided.")
 
-    if "mpnn_temperature" in kwargs:
-        if kwargs["mpnn_temperature"] == "scan":
-            mpnn_temperatures = [0.1, 0.2, 0.5]
-        else:
-            mpnn_temperature = float(kwargs["mpnn_temperature"])
-            assert (
-                0.0 <= mpnn_temperature <= 1.0
-            ), "mpnn_temperature must be between 0 and 1"
-            mpnn_temperatures = [mpnn_temperature]
-    else:
-        mpnn_temperatures = [0.1]
     # setup dict for MPNN design areas
     print_timestamp("Setting up design selectors", start_time)
     # make a designable residue selector of only the interface residues
     chA = ChainSelector(1)
     chB = ChainSelector(2)
-    interface_selector = AndResidueSelector(interface_between_selectors(chA, chB), chA)
-    neighborhood_selector = AndResidueSelector(
-        NeighborhoodResidueSelector(
-            interface_selector, distance=8.0, include_focus_in_subset=True
-        ),
-        chA,
-    )
-    full_selector = chA
-    selector_options = {
-        "full": full_selector,
-        "interface": interface_selector,
-        "neighborhood": neighborhood_selector,
-    }
-    # make the inverse dict of selector options
-    selector_inverse_options = {value: key for key, value in selector_options.items()}
-    if "mpnn_design_area" in kwargs:
-        if kwargs["mpnn_design_area"] == "scan":
-            mpnn_design_areas = [
-                selector_options[key] for key in ["full", "interface", "neighborhood"]
-            ]
-        else:
-            try:
-                mpnn_design_areas = [selector_options[kwargs["mpnn_design_area"]]]
-            except:
-                raise ValueError(
-                    "mpnn_design_area must be one of the following: full, interface, neighborhood"
-                )
-    else:
-        mpnn_design_areas = [selector_options["interface"]]
+    not_interface_selector = NotResidueSelector(interface_between_selectors(chA, chB))
+    chA_not_interface = AndResidueSelector(chA, not_interface_selector)
 
     for pose in poses:
         pose.update_residue_neighbors()
         scores = dict(pose.scores)
         original_pose = pose.clone()
         # iterate over the mpnn parameter combinations
-        mpnn_conditions = list(product(mpnn_temperatures, mpnn_design_areas))
-        num_conditions = len(list(mpnn_conditions))
-        print_timestamp(f"Beginning {num_conditions} MPNNDesign runs", start_time)
-        for i, (mpnn_temperature, mpnn_design_area) in enumerate(list(mpnn_conditions)):
-            pose = original_pose.clone()
-            print_timestamp(
-                f"Beginning MPNNDesign run {i+1}/{num_conditions}", start_time
-            )
-            print_timestamp("Designing interface with MPNN", start_time)
-            # construct the MPNNDesign object
-            mpnn_design = MPNNDesign(
-                design_selector=mpnn_design_area,
-                omit_AAs="X",
-                temperature=mpnn_temperature,
-                **kwargs,
-            )
-            # design the pose
-            mpnn_design.apply(pose)
-            print_timestamp("MPNN design complete, updating pose datacache", start_time)
-            # update the scores dict
-            scores.update(pose.scores)
-            scores.update(
-                {
-                    "mpnn_temperature": mpnn_temperature,
-                    "mpnn_design_area": selector_inverse_options[mpnn_design_area],
-                }
-            )
-            # update the pose with the updated scores dict
-            for key, value in scores.items():
-                pyrosetta.rosetta.core.pose.setPoseExtraScore(pose, key, value)
-            # generate the original pose, with the sequences written to the datacache
-            ppose = io.to_packed(pose)
-            yield ppose
+        print_timestamp("Designing interface with MPNN", start_time)
+        designed_poses = {}
+        # get indices of non-interface residues
+        non_interface_indices = [str(i) for i, in_sel in enumerate(chA_not_interface.apply(pose), start=1) if in_sel]
+        # delete chB
+        sc = pyrosetta.rosetta.protocols.simple_moves.SwitchChainOrderMover()
+        sc.chain_order("1")
+        sc.apply(pose)
+        mpnn_design_area = ResidueIndexSelector(",".join(non_interface_indices))
+        # construct the MPNNDesign object
+        mpnn_design = MPNNDesign(
+            design_selector=mpnn_design_area,
+            omit_AAs="X",
+            **kwargs,
+        )
+        # design the pose
+        mpnn_design.apply(pose)
+        # put chB back
+        chB_pose = original_pose.split_by_chain(2)
+        pyrosetta.rosetta.core.pose.append_pose_to_pose(pose, chB_pose, new_chain=True)
+        sc.chain_order("12")
+        sc.apply(pose)
+        designed_poses["vanilla"] = pose
+        # now do ligandmpnn
+        pose = original_pose.clone()
+        # construct the MPNNLigandDesign object
+        mpnn_design = MPNNLigandDesign(
+            design_selector=chA,
+            params=params_path,
+            omit_AAs="CX",
+            **kwargs,
+        )
+        # design the pose
+        mpnn_design.apply(pose)
+        designed_poses["ligand"] = pose
+        print_timestamp("MPNN design complete, updating pose datacache", start_time)
+        # update the poses with the updated scores dict
+        for design_method, designed_pose in designed_poses.items():
+            final_scores = {**scores, **dict(designed_pose.scores)}
+            pyrosetta.rosetta.core.pose.setPoseExtraScore(designed_pose, "type", design_method)
+            for key, value in final_scores.items():
+                pyrosetta.rosetta.core.pose.setPoseExtraScore(designed_pose, key, value)
+            yield designed_pose
 
 
 @requires_init
