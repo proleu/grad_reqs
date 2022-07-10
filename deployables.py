@@ -3,11 +3,26 @@ from typing import Iterator, Optional
 
 # 3rd party library imports
 # Rosetta library imports
+    from pyrosetta.rosetta.core.pose import Pose
 from pyrosetta.distributed.packed_pose.core import PackedPose
 from pyrosetta.distributed import requires_init
 
 # Custom library imports
 
+
+def get_fullatom_rmsd(design: Pose, prediction: Pose) -> float:
+    """
+    :param: design: Pose to compare to prediction
+    :param: prediction: Pose to compare to design
+    :return: RMSD between the two poses, calculated over all atoms
+    Calculate fullatom RMSD of prediction to design.
+    """
+    rmsd_calc = pyrosetta.rosetta.core.simple_metrics.metrics.RMSDMetric()
+    rmsd_calc.set_rmsd_type(pyrosetta.rosetta.core.scoring.rmsd_atoms(7))
+    rmsd_calc.set_run_superimpose(True)
+    rmsd_calc.set_comparison_pose(design)
+    rmsd = float(rmsd_calc.calculate(prediction))
+    return rmsd
 
 @requires_init
 def pack_around_ligand(
@@ -212,6 +227,7 @@ def fold_binder(
         SuperfoldRunner,
     )
     from crispy_shifty.protocols.mpnn import dict_to_fasta, fasta_to_dict
+    from crispy_shifty.protocols.states import range_CA_align
     from crispy_shifty.utils.io import cmd, print_timestamp
 
     start_time = time()
@@ -232,16 +248,26 @@ def fold_binder(
     for pose in poses:
         pose.update_residue_neighbors()
         scores = dict(pose.scores)
+        # change name of MPNN design type 
+        design_type = scores["type"]
+        del scores["type"]
+        scores["design_type"] = design_type
+        original_pose = pose.clone()
+        # keep a copy of chB for later
+        chB_pose = original_pose.split_by_chain(2)
+        # delete chain B
+        sc = pyrosetta.rosetta.protocols.simple_moves.SwitchChainOrderMover()
+        sc.chain_order("1")
+        sc.apply(pose)
         print_timestamp("Setting up for AF2", start_time)
         runner = SuperfoldRunner(
             pose=pose, fasta_path=fasta_path, load_decoys=True, **kwargs
         )
         runner.setup_runner(file=fasta_path)
-        # initial_guess, reference_pdb both are the tmp.pdb
-        initial_guess = str(Path(runner.get_tmpdir()) / "tmp.pdb")
+        # reference_pdb is the tmp.pdb
+        reference_pdb = str(Path(runner.get_tmpdir()) / "tmp.pdb")
         reference_pdb = initial_guess
         flag_update = {
-            "--initial_guess": initial_guess,
             "--reference_pdb": reference_pdb,
         }
         runner.update_flags(flag_update)
@@ -256,11 +282,14 @@ def fold_binder(
             pyrosetta.rosetta.core.pose.setPoseExtraScore(pose, key, value)
         # setup prefix, rank_on, filter_dict (in this case we can't get from kwargs)
         filter_dict = {
-            "mean_plddt": (gt, 90.0),
+            "mean_plddt": (gt, 85.0),
+            "rmsd_to_reference": (lt, 1.50),
         }
         rank_on = "mean_plddt"
         prefix = "mpnn_seq"
         print_timestamp("Generating decoys", start_time)
+        # get sc ready for putting back chB and rebuilding PDBInfo
+        sc.chain_order("12")
         for decoy in generate_decoys_from_pose(
             pose,
             filter_dict=filter_dict,
@@ -269,93 +298,21 @@ def fold_binder(
             prefix=prefix,
             rank_on=rank_on,
         ):
+            # align decoy back to original pose
+            range_CA_align(
+                decoy,
+                original_pose,
+                decoy.chain_begin(1),
+                decoy.chain_end(1),
+                original_pose.chain_begin(1),
+                original_pose.chain_end(1),
+            )
+            # append chain B to decoy
+            pyrosetta.rosetta.core.pose.append_pose_to_pose(decoy, chB_pose, new_chain=True)
+            # rebuild PDBInfo
+            sc.apply(decoy)
+            # add FA_rmsd to scores after computing it
+            fa_rmsd = get_fullatom_rmsd(original_pose, decoy)
+            pyrosetta.rosetta.core.pose.setPoseExtraScore(decoy, "fa_rmsd", fa_rmsd)
             packed_decoy = io.to_packed(decoy)
             yield packed_decoy
-
-
-@requires_init
-def fold_unbound(
-    packed_pose_in: Optional[PackedPose] = None, **kwargs
-) -> Iterator[PackedPose]:
-    """
-    :param: packed_pose_in: a PackedPose object to fold with the Superfold script.
-    :param: kwargs: keyword arguments to be passed to the Superfold script.
-    :return: an iterator of PackedPose objects.
-    """
-
-    import os
-    import sys
-    from pathlib import Path
-    from time import time
-
-    import pyrosetta
-    import pyrosetta.distributed.io as io
-    from pyrosetta.rosetta.core.pose import Pose
-
-    # insert the root of the repo into the sys.path
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from crispy_shifty.protocols.cleaning import path_to_pose_or_ppose
-    from crispy_shifty.protocols.mpnn import dict_to_fasta, fasta_to_dict
-    from crispy_shifty.utils.io import cmd, print_timestamp
-
-    start_time = time()
-    # get the pdb_path from the kwargs
-    pdb_path = kwargs.pop("pdb_path")
-    # there are multiple paths in the pdb_path, we need to split them and rejoin them
-    pdb_paths = pdb_path.split("____")
-    pdb_path = " ".join(pdb_paths)
-
-    # this function is special, we don't want a packed_pose_in ever, we maintain it as
-    # a kwarg for backward compatibility with PyRosettaCluster
-    if packed_pose_in is not None:
-        raise ValueError("This function is not intended to have a packed_pose_in")
-    else:
-        pass
-
-    print_timestamp("Setting up for AF2", start_time)
-    runner = SuperfoldMultiPDB(input_file=pdb_path, load_decoys=True, **kwargs)
-    runner.setup_runner(chains_to_keep=[1])
-    print_timestamp("Running AF2", start_time)
-    runner.apply()
-    print_timestamp("AF2 complete, updating pose datacache", start_time)
-    # get the updated poses from the runner
-    tag_pose_dict = runner.get_tag_pose_dict()
-    # filter the decoys
-    filter_dict = {
-        "mean_plddt": (gt, 90.0),
-        "rmsd_to_input": (lt, 2.0),
-    }
-    rank_on = "mean_plddt"
-    print_timestamp("Generating decoys", start_time)
-    for tag, pose in tag_pose_dict.items():
-        for decoy in generate_decoys_from_pose(
-            pose,
-            filter_dict=filter_dict,
-            generate_prediction_decoys=False,
-            label_first=False,
-            prefix=tag,
-            rank_on=rank_on,
-        ):
-            scores = dict(decoy.scores)
-            bound_pose = None
-            for original_path in pdb_paths:
-                if tag in original_path:
-                    bound_pose = next(
-                        path_to_pose_or_ppose(
-                            path=original_path, cluster_scores=True, pack_result=False
-                        )
-                    )
-                    final_pose = Pose()
-                    break
-                else:
-                    continue
-            if bound_pose is None:
-                raise RuntimeError
-            else:
-                pass
-            for key, value in scores.items():
-                pyrosetta.rosetta.core.pose.setPoseExtraScore(bound_pose, key, value)
-            final_ppose = io.to_packed(final_pose)
-            yield final_ppose
-
-
