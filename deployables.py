@@ -3,7 +3,7 @@ from typing import Iterator, Optional
 
 # 3rd party library imports
 # Rosetta library imports
-    from pyrosetta.rosetta.core.pose import Pose
+from pyrosetta.rosetta.core.pose import Pose
 from pyrosetta.distributed.packed_pose.core import PackedPose
 from pyrosetta.distributed import requires_init
 
@@ -177,7 +177,11 @@ def mpnn_around_ligand(
         chB_pose = original_pose.split_by_chain(2)
         pyrosetta.rosetta.core.pose.append_pose_to_pose(pose, chB_pose, new_chain=True)
         sc.chain_order("12")
+        vanilla_scores = dict(pose.scores)
         sc.apply(pose)
+        # put the scores back
+        for key, value in vanilla_scores.items():
+            pyrosetta.rosetta.core.pose.setPoseExtraScore(pose, key, value)
         designed_poses["vanilla"] = pose
         # now do ligandmpnn
         pose = original_pose.clone()
