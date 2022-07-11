@@ -17,6 +17,7 @@ def get_fullatom_rmsd(design: Pose, prediction: Pose) -> float:
     :return: RMSD between the two poses, calculated over all atoms
     Calculate fullatom RMSD of prediction to design.
     """
+    import pyrosetta
     rmsd_calc = pyrosetta.rosetta.core.simple_metrics.metrics.RMSDMetric()
     rmsd_calc.set_rmsd_type(pyrosetta.rosetta.core.scoring.rmsd_atoms(7))
     rmsd_calc.set_run_superimpose(True)
@@ -270,7 +271,6 @@ def fold_binder(
         runner.setup_runner(file=fasta_path)
         # reference_pdb is the tmp.pdb
         reference_pdb = str(Path(runner.get_tmpdir()) / "tmp.pdb")
-        reference_pdb = initial_guess
         flag_update = {
             "--reference_pdb": reference_pdb,
         }
@@ -302,6 +302,9 @@ def fold_binder(
             prefix=prefix,
             rank_on=rank_on,
         ):
+            # get decoy scores
+            final_scores = dict(decoy.scores)
+            scores.update(final_scores)
             # align decoy back to original pose
             range_CA_align(
                 decoy,
@@ -315,6 +318,12 @@ def fold_binder(
             pyrosetta.rosetta.core.pose.append_pose_to_pose(decoy, chB_pose, new_chain=True)
             # rebuild PDBInfo
             sc.apply(decoy)
+            # add scores back into decoy
+            for key, value in scores.items():
+                if "mpnn_seq" not in key:
+                    pyrosetta.rosetta.core.pose.setPoseExtraScore(decoy, key, value)
+                else:
+                    continue
             # add FA_rmsd to scores after computing it
             fa_rmsd = get_fullatom_rmsd(original_pose, decoy)
             pyrosetta.rosetta.core.pose.setPoseExtraScore(decoy, "fa_rmsd", fa_rmsd)
