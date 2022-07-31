@@ -1,11 +1,12 @@
 # Python standard library
 from typing import Iterator, Optional
 
+from pyrosetta.distributed import requires_init
+from pyrosetta.distributed.packed_pose.core import PackedPose
+
 # 3rd party library imports
 # Rosetta library imports
 from pyrosetta.rosetta.core.pose import Pose
-from pyrosetta.distributed.packed_pose.core import PackedPose
-from pyrosetta.distributed import requires_init
 
 # Custom library imports
 
@@ -18,12 +19,14 @@ def get_fullatom_rmsd(design: Pose, prediction: Pose) -> float:
     Calculate fullatom RMSD of prediction to design.
     """
     import pyrosetta
+
     rmsd_calc = pyrosetta.rosetta.core.simple_metrics.metrics.RMSDMetric()
     rmsd_calc.set_rmsd_type(pyrosetta.rosetta.core.scoring.rmsd_atoms(7))
     rmsd_calc.set_run_superimpose(True)
     rmsd_calc.set_comparison_pose(design)
     rmsd = float(rmsd_calc.calculate(prediction))
     return rmsd
+
 
 @requires_init
 def pack_around_ligand(
@@ -36,9 +39,10 @@ def pack_around_ligand(
     Pack residues contacting ligand.
     """
 
-    from pathlib import Path
     import sys
+    from pathlib import Path
     from time import time
+
     import pyrosetta
     import pyrosetta.distributed.io as io
     from pyrosetta.rosetta.core.select.residue_selector import (
@@ -50,7 +54,11 @@ def pack_around_ligand(
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from crispy_shifty.protocols.cleaning import path_to_pose_or_ppose
     from crispy_shifty.protocols.design import (
-        gen_scorefxn, gen_std_layer_design, gen_task_factory, interface_between_selectors, pack_rotamers
+        gen_scorefxn,
+        gen_std_layer_design,
+        gen_task_factory,
+        interface_between_selectors,
+        pack_rotamers,
     )
     from crispy_shifty.utils.io import print_timestamp
 
@@ -65,7 +73,7 @@ def pack_around_ligand(
         poses = path_to_pose_or_ppose(
             path=pdb_path, cluster_scores=True, pack_result=False
         )
-    
+
     print_timestamp("Setting design options", start_time)
 
     # generate interface and chA selectors
@@ -75,7 +83,7 @@ def pack_around_ligand(
     interface_and_chA = AndResidueSelector(interface, chA)
     # generate scorefxn
     scorefxn = gen_scorefxn()
-    # generate task factory 
+    # generate task factory
     task_factory = gen_task_factory(
         design_sel=interface_and_chA,
         pack_nbhd=True,
@@ -107,10 +115,11 @@ def mpnn_around_ligand(
     :return: an iterator of PackedPose objects.
     """
 
+    import sys
     from itertools import product
     from pathlib import Path
-    import sys
     from time import time
+
     import pyrosetta
     import pyrosetta.distributed.io as io
     from pyrosetta.rosetta.core.select.residue_selector import (
@@ -124,7 +133,7 @@ def mpnn_around_ligand(
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from crispy_shifty.protocols.cleaning import path_to_pose_or_ppose
     from crispy_shifty.protocols.design import interface_between_selectors
-    from crispy_shifty.protocols.mpnn import MPNNLigandDesign, MPNNDesign
+    from crispy_shifty.protocols.mpnn import MPNNDesign, MPNNLigandDesign
     from crispy_shifty.utils.io import print_timestamp
 
     start_time = time()
@@ -160,7 +169,11 @@ def mpnn_around_ligand(
         print_timestamp("Designing interface with MPNN", start_time)
         designed_poses = {}
         # get indices of non-interface residues
-        non_interface_indices = [str(i) for i, in_sel in enumerate(chA_not_interface.apply(pose), start=1) if in_sel]
+        non_interface_indices = [
+            str(i)
+            for i, in_sel in enumerate(chA_not_interface.apply(pose), start=1)
+            if in_sel
+        ]
         # delete chB
         sc = pyrosetta.rosetta.protocols.simple_moves.SwitchChainOrderMover()
         sc.chain_order("1")
@@ -200,7 +213,9 @@ def mpnn_around_ligand(
         # update the poses with the updated scores dict
         for design_method, designed_pose in designed_poses.items():
             final_scores = {**scores, **dict(designed_pose.scores)}
-            pyrosetta.rosetta.core.pose.setPoseExtraScore(designed_pose, "type", design_method)
+            pyrosetta.rosetta.core.pose.setPoseExtraScore(
+                designed_pose, "type", design_method
+            )
             for key, value in final_scores.items():
                 pyrosetta.rosetta.core.pose.setPoseExtraScore(designed_pose, key, value)
             yield designed_pose
@@ -216,10 +231,11 @@ def fold_binder(
     :return: an iterator of PackedPose objects.
     """
 
-    from operator import lt, gt
-    from pathlib import Path
     import sys
+    from operator import gt, lt
+    from pathlib import Path
     from time import time
+
     import pyrosetta
     import pyrosetta.distributed.io as io
     from pyrosetta.rosetta.core.pose import Pose
@@ -228,8 +244,8 @@ def fold_binder(
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from crispy_shifty.protocols.cleaning import path_to_pose_or_ppose
     from crispy_shifty.protocols.folding import (
-        generate_decoys_from_pose,
         SuperfoldRunner,
+        generate_decoys_from_pose,
     )
     from crispy_shifty.protocols.mpnn import dict_to_fasta, fasta_to_dict
     from crispy_shifty.protocols.states import range_CA_align
@@ -253,7 +269,7 @@ def fold_binder(
     for pose in poses:
         pose.update_residue_neighbors()
         scores = dict(pose.scores)
-        # change name of MPNN design type 
+        # change name of MPNN design type
         design_type = scores["type"]
         del scores["type"]
         scores["design_type"] = design_type
@@ -315,7 +331,9 @@ def fold_binder(
                 original_pose.chain_end(1),
             )
             # append chain B to decoy
-            pyrosetta.rosetta.core.pose.append_pose_to_pose(decoy, chB_pose, new_chain=True)
+            pyrosetta.rosetta.core.pose.append_pose_to_pose(
+                decoy, chB_pose, new_chain=True
+            )
             # rebuild PDBInfo
             sc.apply(decoy)
             # add scores back into decoy
@@ -329,3 +347,142 @@ def fold_binder(
             pyrosetta.rosetta.core.pose.setPoseExtraScore(decoy, "fa_rmsd", fa_rmsd)
             packed_decoy = io.to_packed(decoy)
             yield packed_decoy
+
+
+@requires_init
+def redock_ligand(
+    packed_pose_in: Optional[PackedPose] = None, **kwargs
+) -> Iterator[PackedPose]:
+    """
+    :param: packed_pose_in: PackedPose object to redock.
+    :param: kwargs: Keyword arguments to pass to redock_ligand.
+    :return: Iterator of PackedPose objects.
+    Cartesian minimization of the AF2 decoy to relax into the Rosetta sfxn, then
+    GALigandDock to dock the ligand into the relaxed decoy structure.
+    """
+
+    import sys
+    from pathlib import Path
+    from time import time
+
+    import pyrosetta
+    import pyrosetta.distributed.io as io
+    from pyrosetta.rosetta.core.select.residue_selector import (
+        AndResidueSelector,
+        ChainSelector,
+    )
+
+    # insert the root of the repo into the sys.path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from crispy_shifty.protocols.cleaning import path_to_pose_or_ppose
+    from crispy_shifty.protocols.design import (
+        fast_relax,
+        gen_movemap,
+        gen_scorefxn,
+        gen_task_factory,
+        interface_between_selectors,
+    )
+    from crispy_shifty.utils.io import print_timestamp
+
+    start_time = time()
+
+    # generate poses or convert input packed pose into pose
+    if packed_pose_in is not None:
+        poses = [io.to_pose(packed_pose_in)]
+        pdb_path = "none"
+    else:
+        pdb_path = kwargs["pdb_path"]
+        poses = path_to_pose_or_ppose(
+            path=pdb_path, cluster_scores=True, pack_result=False
+        )
+
+    print_timestamp("Setting relax options", start_time)
+
+    # check for custom_relax_script kwarg
+    if "custom_relax_script" in kwargs:
+        relax_script = kwargs["custom_relax_script"]
+    else:
+        relax_script = "MonomerRelax2019"
+
+    # generate interface and chA selectors
+    chA = ChainSelector("1")
+    chB = ChainSelector("2")
+    interface = interface_between_selectors(chA, chB)
+    interface_and_chA = AndResidueSelector(interface, chA)
+    # generate cartesian constrained scorefxn
+    scorefxn = gen_scorefxn(cartesian=True, weights="beta_cst.wts")
+    # generate task factory
+    task_factory = gen_task_factory(
+        pack_sel=chA,
+        extra_rotamers_level=2,
+        ifcl=True,
+    )
+    # generate movemap
+    mm = gen_movemap(jump=True, chi=True, bb=True)
+
+    for pose in poses:
+        print_timestamp("Relaxing with ligand", start_time)
+        pose.update_residue_neighbors()
+        scores = dict(pose.scores)
+        original_pose = pose.clone()
+        # relax pose
+        fast_relax(
+            pose=pose,
+            task_factory=task_factory,
+            scorefxn=scorefxn,
+            movemap=mm,
+            relax_script=relax_script,
+            repeats=1,
+            cartesian=True,
+            coord_constrain_sidechains=True,
+            constrain_relax_to_start_coords=True,
+        )
+        print_timestamp("Relax complete", start_time)
+        run_ligand_dock(pose, holo=scores["path_in"])
+        print_timestamp("Ligand dock complete", start_time)
+        scores.update(pose.scores)
+        for key, value in scores.items():
+            pyrosetta.rosetta.core.pose.setPoseExtraScore(pose, key, value)
+        ppose = io.to_packed(pose)
+        yield ppose
+
+
+def run_ligand_dock(pose: Pose, **kwargs) -> None:
+    """
+    :param: pose: Pose object to run GALigandDock on.
+    :param: kwargs: Keywords to pass to GALigandDock.
+    :return: None.
+    """
+    import pyrosetta
+
+    if "holo" in kwargs:
+        holo = kwargs["holo"]
+    else:
+        raise ValueError("Must specify holo keyword argument.")
+
+    xml_snippet = f"""
+    <SCOREFXNS>
+        <ScoreFunction name="dockscore" weights="beta">
+            <Reweight scoretype="fa_rep" weight="0.2"/>
+        </ScoreFunction>
+        <ScoreFunction name="relaxscore" weights="beta_cart">
+            <Reweight scoretype="fa_rep" weight="0.2"/>
+            <Reweight scoretype="coordinate_constraint" weight="0.1"/>
+        </ScoreFunction>
+    </SCOREFXNS>
+    <MOVERS>
+        <GALigandDock name="dock" scorefxn="dockscore" scorefxn_relax="relaxscore" 
+        runmode="dockflex" nativepdb="{holo}" final_exact_minimize="bbsc1"
+        cartmin_lig="1" padding="6.0" sidechains="aniso" >
+            <Stage repeats="10" npool="50" pmut="0.2" smoothing="0.375" 
+            rmsdthreshold="1.0" maxiter="50" pack_cycles="100" 
+            ramp_schedule="0.1,1.0"/>
+        </GALigandDock>
+    </MOVERS>
+    """
+    objs = pyrosetta.rosetta.protocols.rosetta_scripts.XmlObjects.create_from_string(
+        xml_snippet
+    )
+    docker = objs.get_mover("dock")
+    docker.apply(pose)
+    return
