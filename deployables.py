@@ -1,5 +1,5 @@
 # Python standard library
-from typing import Iterator, Optional
+from typing import Iterator, List, Optional
 
 from pyrosetta.distributed import requires_init
 from pyrosetta.distributed.packed_pose.core import PackedPose
@@ -486,3 +486,147 @@ def run_ligand_dock(pose: Pose, **kwargs) -> None:
     docker = objs.get_mover("dock")
     docker.apply(pose)
     return
+
+
+@requires_init
+def check_linker_accessibility(
+    packed_pose_in: Optional[PackedPose] = None, **kwargs
+) -> Iterator[PackedPose]:
+    """
+    :param: packed_pose_in: PackedPose object to filter.
+    :param: kwargs: Keyword arguments to pass to this function.
+    :return: Iterator of PackedPose objects.
+    Check the atomic burial of linker atoms, as well as cms and ddg of the small molecule.
+    """
+
+    import sys
+    from pathlib import Path
+    from time import time
+
+    import pyrosetta
+    import pyrosetta.distributed.io as io
+    from pyrosetta.rosetta.core.select.residue_selector import (
+        ChainSelector,
+        NeighborhoodResidueSelector,
+        OrResidueSelector,
+    )
+
+    # insert the root of the repo into the sys.path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from crispy_shifty.protocols.cleaning import path_to_pose_or_ppose
+    from crispy_shifty.protocols.design import (
+        gen_scorefxn,
+        gen_task_factory,
+        pack_rotamers,
+        score_cms,  
+        score_ddg,
+    )
+    from crispy_shifty.utils.io import print_timestamp
+
+    start_time = time()
+
+    # generate poses or convert input packed pose into pose
+    if packed_pose_in is not None:
+        poses = [io.to_pose(packed_pose_in)]
+        pdb_path = "none"
+    else:
+        pdb_path = kwargs["pdb_path"]
+        poses = path_to_pose_or_ppose(
+            path=pdb_path, cluster_scores=True, pack_result=False
+        )
+
+    print_timestamp("Setting up for repack", start_time)
+
+    # make selectors
+    chA = ChainSelector(1)
+    chB = ChainSelector(2)
+    around_chB = NeighborhoodResidueSelector(chB, 15)
+    interface_or_chB = OrResidueSelector(around_chB, chB)
+    # make stuff for repacker
+    scorefxn = gen_scorefxn(
+        cartesian=False, res_type_constraint=False, hbonds=False, weights="ref2015"
+    )
+    scorefxn.set_weight(pyrosetta.rosetta.core.scoring.fa_intra_rep, 0.55)
+    task_factory = gen_task_factory(
+        design_sel=None,
+        pack_sel=interface_or_chB,
+    )
+
+    # check for atom_ids kwarg
+    try:
+        atom_ids = kwargs["atom_ids"]
+    except KeyError:
+        raise ValueError("Must specify atom_ids keyword argument.")
+    # repack allowing ligand chi dofs
+    for pose in poses:
+        print_timestamp("Repacking ligand linker", start_time)
+        pose.update_residue_neighbors()
+        scores = dict(pose.scores)
+        original_pose = pose.clone()
+        # repack linker
+        pack_rotamers(
+            pose=pose,
+            scorefxn=scorefxn,
+            task_factory=task_factory,
+        )
+        # get linker burial
+        linker_burial = read_lig_atm_sasa(pose, atom_ids.split(","), probe_radius=3.0)
+        # rechain
+        sc = pyrosetta.rosetta.protocols.simple_moves.SwitchChainOrderMover()
+        sc.chain_order("12")
+        sc.apply(pose)
+        # score cms
+        cms = score_cms(pose=pose, sel_1=chA, sel_2=chB)
+        # score ddg
+        ddg = score_ddg(pose=pose)
+        # update scores
+        scores.update(pose.scores)
+        scores["linker_burial"] = linker_burial
+        print_timestamp("Filtering complete", start_time)
+        for key, value in scores.items():
+            pyrosetta.rosetta.core.pose.setPoseExtraScore(pose, key, value)
+        ppose = io.to_packed(pose)
+        yield ppose
+
+
+def read_lig_atm_sasa(pose: Pose, atmName_to_read=List[str], probe_radius=1.4) -> float:
+    """
+    :param: pose: Pose object to read sasa from.
+    :param: atmName_to_read: List of atom names to read sasa for.
+    :param: probe_radius: Radius of the probe sphere.
+    :return: SASA of the ligand.
+    GRL wrote this function.
+    """
+
+    import copy
+    import numpy as np
+    import pyrosetta
+
+    atm_depth_s = pyrosetta.rosetta.core.scoring.atomic_depth.atomic_depth(
+        pose, probe_radius
+    )
+    lig_resNo = pose.total_residue()
+    lig_res = pose.residue(lig_resNo)
+    res_natm = pose.pdb_info().natoms(lig_resNo)
+    # this returns all atom values in list for the residue
+
+    tmp_atm_names = []
+    for i_atm_loc in range(1, res_natm + 1):
+        atm_name = lig_res.atom_name(i_atm_loc)
+        tmp_atm_names.append(atm_name)
+
+    atmNames = []
+    if len(atmName_to_read) > 0:
+        for atmName in tmp_atm_names:
+            if atmName.strip() in atmName_to_read:
+                atmNames.append(atmName)
+    else:
+        atmNames = copy.deepcopy(tmp_atm_names)
+
+    atom_depths = []
+    for atm_name in atmNames:
+        atm_id = pyrosetta.rosetta.core.id.AtomID(
+            lig_res.atom_index("%s" % atm_name), lig_resNo
+        )
+        atom_depths.append(atm_depth_s(atm_id))
+    return np.sum(atom_depths)
