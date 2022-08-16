@@ -630,3 +630,95 @@ def read_lig_atm_sasa(pose: Pose, atmName_to_read=List[str], probe_radius=1.4) -
         )
         atom_depths.append(atm_depth_s(atm_id))
     return np.sum(atom_depths)
+
+@requires_init
+def refilter(
+    packed_pose_in: Optional[PackedPose] = None, **kwargs
+) -> Iterator[PackedPose]:
+    """
+    :param: packed_pose_in: PackedPose object to filter.
+    :param: kwargs: Keyword arguments to pass to this function.
+    :return: Iterator of PackedPose objects.
+    Redo cms and ddg of the small molecule.
+    """
+
+    import sys
+    from pathlib import Path
+    from time import time
+
+    import pyrosetta
+    import pyrosetta.distributed.io as io
+    from pyrosetta.rosetta.core.select.residue_selector import (
+        ChainSelector, # TODO
+        NeighborhoodResidueSelector,
+        OrResidueSelector,
+    )
+
+    # insert the root of the repo into the sys.path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from crispy_shifty.protocols.cleaning import path_to_pose_or_ppose
+    from crispy_shifty.protocols.design import (
+        gen_scorefxn,
+        gen_task_factory,
+        pack_rotamers,
+        score_cms,  
+        score_ddg,
+    )
+    from crispy_shifty.utils.io import print_timestamp
+
+    start_time = time()
+
+    # generate poses or convert input packed pose into pose
+    if packed_pose_in is not None:
+        poses = [io.to_pose(packed_pose_in)]
+        pdb_path = "none"
+    else:
+        pdb_path = kwargs["pdb_path"]
+        poses = path_to_pose_or_ppose(
+            path=pdb_path, cluster_scores=True, pack_result=False
+        )
+
+    print_timestamp("Setting up for repack", start_time)
+
+    # make selectors
+    chA = ChainSelector(1)
+    chB = ChainSelector(2)
+    around_chB = NeighborhoodResidueSelector(chB, 15)
+    interface_or_chB = OrResidueSelector(around_chB, chB)
+    # make stuff for repacker
+    scorefxn = gen_scorefxn(
+        cartesian=False, res_type_constraint=False, hbonds=False, weights="beta"
+    )
+    task_factory = gen_task_factory(
+        design_sel=None,
+        pack_sel=interface_or_chB,
+    )
+
+    # repack
+    for pose in poses:
+        print_timestamp("Repacking around ligand", start_time)
+        pose.update_residue_neighbors()
+        scores = dict(pose.scores)
+        original_pose = pose.clone()
+        # repack linker
+        pack_rotamers(
+            pose=pose,
+            scorefxn=scorefxn,
+            task_factory=task_factory,
+        )
+        # rechain
+        sc = pyrosetta.rosetta.protocols.simple_moves.SwitchChainOrderMover()
+        sc.chain_order("12")
+        sc.apply(pose)
+        # score cms
+        cms = score_cms(pose=pose, sel_1=chA, sel_2=chB)
+        # score ddg
+        ddg = score_ddg(pose=pose)
+        # update scores
+        scores.update(pose.scores)
+        print_timestamp("Filtering complete", start_time)
+        for key, value in scores.items():
+            pyrosetta.rosetta.core.pose.setPoseExtraScore(pose, key, value)
+        ppose = io.to_packed(pose)
+        yield ppose
+
